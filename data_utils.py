@@ -267,6 +267,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         sid = torch.LongTensor([int(sid)])
         return sid
 
+    def get_unique_sids(self):
+        sids_set = set([int(audiopath_sid_text[1]) for audiopath_sid_text in self.audiopaths_sid_text])
+        return torch.LongTensor(sorted(list(sids_set)))
+
     def __getitem__(self, index):
         return self.get_audio_text_speaker_pair(self.audiopaths_sid_text[index])
 

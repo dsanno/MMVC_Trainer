@@ -600,11 +600,26 @@ class VoiceConverter(nn.Module):
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
     self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-  def forward(self, y, y_lengths, sid_src, sid_tgt):
-    g_src = self.emb_g(sid_src).unsqueeze(-1)
-    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+  def forward(self, y, y_lengths, sid_src, sid_tgt, repeat=False):
+    y_mask, (z, z_p, m_q, logs_q) = self.encode(y, y_lengths, sid_src)
+    if repeat:
+      n_repeat = sid_tgt.size(0) // sid_src.size(0)
+      y_mask = y_mask.repeat(n_repeat, 1, 1)
+      z = z.repeat(n_repeat, 1, 1)
+      z_p = z_p.repeat(n_repeat, 1, 1)
+      m_q = m_q.repeat(n_repeat, 1, 1)
+      logs_q = logs_q.repeat(n_repeat, 1, 1)
+    o_hat, z_hat = self.decode(z_p, y_mask, sid_tgt)
+    return o_hat, y_mask, (z, z_p, z_hat, m_q, logs_q)
+
+  def encode(self, y, y_lengths, sid):
+    g_src = self.emb_g(sid).unsqueeze(-1)
     z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g_src)
     z_p = self.flow(z, y_mask, g=g_src)
+    return y_mask, (z, z_p, m_q, logs_q)
+
+  def decode(self, z_p, y_mask, sid):
+    g_tgt = self.emb_g(sid).unsqueeze(-1)
     z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
     o_hat = self.dec(z_hat * y_mask, g=g_tgt)
-    return o_hat, y_mask, (z, z_p, z_hat, m_q, logs_q)
+    return o_hat, z_hat

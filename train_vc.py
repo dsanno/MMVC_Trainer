@@ -75,6 +75,9 @@ def run(rank, n_gpus, hps):
   collate_fn = TextAudioSpeakerCollate()
   train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
       collate_fn=collate_fn, batch_sampler=train_sampler)
+  index_to_sid = train_dataset.get_unique_sids().cuda(rank)
+  sid_to_index = torch.zeros(hps.data.n_speakers, dtype=torch.int64, device=index_to_sid.device)
+  sid_to_index[index_to_sid] = torch.arange(index_to_sid.size(0), device=index_to_sid.device)
   if rank == 0:
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files_notext, hps.data)
     eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
@@ -102,8 +105,8 @@ def run(rank, n_gpus, hps):
   if hps.fine_flag:
     logger.info('Load model : '+str(hps.fine_model_g))
     logger.info('Load model : '+str(hps.fine_model_d))
-    _, _, _, epoch_str = utils.load_checkpoint(hps.fine_model_g, net_g, optim_g)
-    _, _, _, epoch_str = utils.load_checkpoint(hps.fine_model_d, net_d, optim_d)
+    _, _, _, epoch_str = utils.load_checkpoint(hps.fine_model_g, net_g)
+    _, _, _, epoch_str = utils.load_checkpoint(hps.fine_model_d, net_d)
     epoch_str = 1
     global_step = 0
   else:
@@ -122,9 +125,11 @@ def run(rank, n_gpus, hps):
 
   for epoch in range(epoch_str, hps.train.epochs + 1):
     if rank==0:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], scaler, [train_loader, eval_loader], logger, [writer, writer_eval])
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], scaler, [train_loader, eval_loader],
+                         sid_to_index, index_to_sid, logger, [writer, writer_eval])
     else:
-      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], scaler, [train_loader, None], None, None)
+      train_and_evaluate(rank, epoch, hps, [net_g, net_d], [optim_g, optim_d], scaler, [train_loader, None],
+                         sid_to_index, index_to_sid, None, None)
     scheduler_g.step()
     scheduler_d.step()
   utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir,
@@ -133,7 +138,7 @@ def run(rank, n_gpus, hps):
                         "D_{}.pth".format(global_step)))
 
 
-def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, logger, writers):
+def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, sid_to_index, index_to_sid, logger, writers):
   net_g, net_d = nets
   optim_g, optim_d = optims
   train_loader, eval_loader = loaders
@@ -153,7 +158,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, logger, 
     with autocast(enabled=hps.train.fp16_run):
       spec_segment_size = hps.train.segment_size // hps.data.hop_length
       spec, ids_slice = commons.rand_slice_segments(spec, spec_lengths, spec_segment_size)
-      spec_lengths = torch.full((spec.shape[0],), spec_segment_size, device=spec.device)
+      spec_lengths = torch.full((spec.shape[0],), spec_segment_size, dtype=torch.int64, device=spec.device)
       y_hat, z_mask, (z, z_p, z_hat, m_q, logs_q) = net_g(spec, spec_lengths, speakers, speakers)
 
       y_mel = spec_to_mel_torch(
@@ -229,7 +234,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, logger, 
           images=image_dict,
           scalars=scalar_dict)
       if global_step % hps.train.eval_interval == 0:
-        evaluate(hps, net_g, eval_loader, writer_eval, logger)
+        evaluate(hps, net_g, eval_loader, sid_to_index, index_to_sid, writer_eval, logger)
         utils.save_checkpoint(net_g, optim_g, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "G_{}.pth".format(global_step)))
         utils.save_checkpoint(net_d, optim_d, hps.train.learning_rate, epoch, os.path.join(hps.model_dir, "D_{}.pth".format(global_step)))
     global_step += 1
@@ -238,7 +243,7 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, logger, 
     logger.info('====> Epoch: {}'.format(epoch))
 
 
-def evaluate(hps, generator, eval_loader, writer_eval, logger):
+def evaluate(hps, generator, eval_loader, sid_to_index, index_to_sid, writer_eval, logger):
     generator.eval()
     scalar_dict = {}
     scalar_dict.update({"loss/g/mel": 0.0, "loss/g/dur": 0.0, "loss/g/kl": 0.0})
@@ -253,7 +258,7 @@ def evaluate(hps, generator, eval_loader, writer_eval, logger):
           #Generator
           spec_segment_size = hps.train.segment_size // hps.data.hop_length
           spec, ids_slice = commons.rand_slice_segments(spec, spec_lengths, spec_segment_size)
-          spec_lengths = torch.full((spec.shape[0],), spec_segment_size, device=spec.device)
+          spec_lengths = torch.full((spec.shape[0],), spec_segment_size, dtype=torch.int64, device=spec.device)
           y_hat, z_mask, (z, z_p, z_hat, m_q, logs_q) = generator(spec, spec_lengths, speakers, speakers)
 
           y_mel = spec_to_mel_torch(
@@ -327,11 +332,30 @@ def evaluate(hps, generator, eval_loader, writer_eval, logger):
         hps.data.mel_fmin,
         hps.data.mel_fmax
       )
+
+      # Convert voice to another speaker
+      another_speakers = index_to_sid[(sid_to_index[speakers] + 1) % index_to_sid.size(0)]
+      vc_y_hat, vc_mask, *_ = generator(spec, spec_lengths, speakers, another_speakers)
+      vc_y_hat_lengths = vc_mask.sum([1,2]).long() * hps.data.hop_length
+
+      vc_y_hat_mel = mel_spectrogram_torch(
+        y_hat.squeeze(1).float(),
+        hps.data.filter_length,
+        hps.data.n_mel_channels,
+        hps.data.sampling_rate,
+        hps.data.hop_length,
+        hps.data.win_length,
+        hps.data.mel_fmin,
+        hps.data.mel_fmax
+      )
+
     image_dict = {
-      "gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy())
+      "gen/mel": utils.plot_spectrogram_to_numpy(y_hat_mel[0].cpu().numpy()),
+      "convert/mel": utils.plot_spectrogram_to_numpy(vc_y_hat_mel[0].cpu().numpy()),
     }
     audio_dict = {
-      "gen/audio": y_hat[0,:,:y_hat_lengths[0]]
+      "gen/audio": y_hat[0,:,:y_hat_lengths[0]],
+      "convert/audio": vc_y_hat[0,:,:vc_y_hat_lengths[0]],
     }
     if global_step == 0:
       image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})
