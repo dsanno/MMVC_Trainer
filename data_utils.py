@@ -205,9 +205,10 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
     def get_audio_text_speaker_pair(self, audiopath_sid_text):
         # separate filename, speaker_id and text
         audiopath, sid, text = audiopath_sid_text[0], audiopath_sid_text[1], audiopath_sid_text[2]
-        text = self.get_text(text)
         if self.no_text:
           text = self.get_text("a")
+        else:
+          text = self.get_text(text)
         spec, wav = self.get_audio(audiopath)
         sid = self.get_sid(sid)
         return (text, spec, wav, sid)
@@ -228,29 +229,17 @@ class TextAudioSpeakerLoader(torch.utils.data.Dataset):
         audio_norm = audio / self.max_wav_value
         audio_norm = audio_norm.unsqueeze(0)
         spec_filename = filename.replace(".wav", ".spec.pt")
-        spec_file_path =os.path.dirname(spec_filename) + "/spec/"+ os.path.basename(spec_filename)
+        spec_file_dir = os.path.join(os.path.dirname(spec_filename), "spec")
+        spec_file_path = os.path.join(spec_file_dir, os.path.basename(spec_filename))
         if os.path.exists(spec_file_path):
-            #spec = torch.load(spec_file_path)
-            if os.path.isdir(os.path.dirname(spec_filename) + "/spec") == False:
-              os.mkdir(os.path.dirname(spec_filename) + "/spec")
-            spec = spectrogram_torch(audio_norm, self.filter_length,
-                self.sampling_rate, self.hop_length, self.win_length,
-                center=False)
-            spec = torch.squeeze(spec, 0)
-            torch.save(spec, spec_file_path)
+            spec = torch.load(spec_file_path)
         else:
-            if os.path.isdir(os.path.dirname(spec_filename) + "/spec") == False:
-              os.mkdir(os.path.dirname(spec_filename) + "/spec")
+            os.makedirs(spec_file_dir, exist_ok=True)
             spec = spectrogram_torch(audio_norm, self.filter_length,
                 self.sampling_rate, self.hop_length, self.win_length,
                 center=False)
             spec = torch.squeeze(spec, 0)
             torch.save(spec, spec_file_path)
-        # spec = spectrogram_torch(audio_norm, self.filter_length,
-        #     self.sampling_rate, self.hop_length, self.win_length,
-        #     center=False)
-        # spec = torch.squeeze(spec, 0)
-        # torch.save(spec, spec_filename)
         return spec, audio_norm
 
     def get_text(self, text):

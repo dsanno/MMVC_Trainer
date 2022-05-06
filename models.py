@@ -176,6 +176,47 @@ class TextEncoder(nn.Module):
     return x, m, logs, x_mask
 
 
+class VQTextEncoder(nn.Module):
+  def __init__(self,
+      n_vocab,
+      out_channels,
+      hidden_channels,
+      filter_channels,
+      n_heads,
+      n_layers,
+      kernel_size,
+      p_dropout):
+    super().__init__()
+    self.n_vocab = n_vocab
+    self.out_channels = out_channels
+    self.hidden_channels = hidden_channels
+    self.filter_channels = filter_channels
+    self.n_heads = n_heads
+    self.n_layers = n_layers
+    self.kernel_size = kernel_size
+    self.p_dropout = p_dropout
+
+    self.emb = nn.Embedding(n_vocab, hidden_channels)
+    nn.init.normal_(self.emb.weight, 0.0, hidden_channels**-0.5)
+
+    self.encoder = attentions.Encoder(
+      hidden_channels,
+      filter_channels,
+      n_heads,
+      n_layers,
+      kernel_size,
+      p_dropout)
+    self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
+
+  def forward(self, x, x_lengths):
+    x = self.emb(x) * math.sqrt(self.hidden_channels) # [b, t, h]
+    x = torch.transpose(x, 1, -1) # [b, h, t]
+    x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+
+    x = self.encoder(x * x_mask, x_mask)
+    return x, self.proj(x) * x_mask, x_mask
+
+
 class ResidualCouplingBlock(nn.Module):
   def __init__(self,
       channels,
@@ -241,6 +282,35 @@ class PosteriorEncoder(nn.Module):
     return z, m, logs, x_mask
 
 
+class VQPosteriorEncoder(nn.Module):
+  def __init__(self,
+      in_channels,
+      out_channels,
+      hidden_channels,
+      kernel_size,
+      dilation_rate,
+      n_layers,
+      gin_channels=0):
+    super().__init__()
+    self.in_channels = in_channels
+    self.out_channels = out_channels
+    self.hidden_channels = hidden_channels
+    self.kernel_size = kernel_size
+    self.dilation_rate = dilation_rate
+    self.n_layers = n_layers
+    self.gin_channels = gin_channels
+
+    self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+    self.enc = modules.WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels)
+    self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
+
+  def forward(self, x, x_lengths, g=None):
+    x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+    x = self.pre(x) * x_mask
+    x = self.enc(x, x_mask, g=g)
+    return self.proj(x) * x_mask, x_mask
+
+
 class Generator(torch.nn.Module):
     def __init__(self, initial_channel, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=0):
         super(Generator, self).__init__()
@@ -265,14 +335,12 @@ class Generator(torch.nn.Module):
         self.ups.apply(init_weights)
 
         if gin_channels != 0:
-            #self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
-            gin_channels = 0
+            self.cond = nn.Conv1d(gin_channels, upsample_initial_channel, 1)
 
     def forward(self, x, g=None):
         x = self.conv_pre(x)
         if g is not None:
-          #x = x + self.cond(g)
-          g=None
+          x = x + self.cond(g)
 
         for i in range(self.num_upsamples):
             x = F.leaky_relu(x, modules.LRELU_SLOPE)
@@ -561,6 +629,288 @@ class SynthesizerTrn(nn.Module):
     return o_hat, y_mask, (z, z_p, z_hat)
 
 
+class VQSynthesizerTrn(nn.Module):
+  """
+  Synthesizer for Training
+  """
+
+  def __init__(self, 
+    n_vocab,
+    spec_channels,
+    segment_size,
+    inter_channels,
+    hidden_channels,
+    filter_channels,
+    n_heads,
+    n_layers,
+    kernel_size,
+    p_dropout,
+    resblock, 
+    resblock_kernel_sizes, 
+    resblock_dilation_sizes, 
+    upsample_rates, 
+    upsample_initial_channel, 
+    upsample_kernel_sizes,
+    quant_channels=64,
+    n_quants=512,
+    n_speakers=0,
+    gin_channels=0,
+    use_sdp=True,
+    **kwargs):
+
+    super().__init__()
+    self.n_vocab = n_vocab
+    self.spec_channels = spec_channels
+    self.hidden_channels = hidden_channels
+    self.filter_channels = filter_channels
+    self.n_heads = n_heads
+    self.n_layers = n_layers
+    self.kernel_size = kernel_size
+    self.p_dropout = p_dropout
+    self.resblock = resblock
+    self.resblock_kernel_sizes = resblock_kernel_sizes
+    self.resblock_dilation_sizes = resblock_dilation_sizes
+    self.upsample_rates = upsample_rates
+    self.upsample_initial_channel = upsample_initial_channel
+    self.upsample_kernel_sizes = upsample_kernel_sizes
+    self.segment_size = segment_size
+    self.n_speakers = n_speakers
+    self.gin_channels = gin_channels
+
+    self.use_sdp = use_sdp
+
+    self.enc_p = VQTextEncoder(n_vocab,
+        inter_channels,
+        hidden_channels,
+        filter_channels,
+        n_heads,
+        n_layers,
+        kernel_size,
+        p_dropout)
+    self.quantize_p_pre = nn.Conv1d(inter_channels, quant_channels, 1)
+    self.quantize_p = modules.Quantize(quant_channels, n_quants)
+    self.quantize_p_post = nn.Conv1d(quant_channels, inter_channels, 1)
+    self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
+    self.enc_q = VQPosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
+##    self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
+#    self.quantize_q_pre = nn.Conv1d(inter_channels, quant_channels, 1)
+#    self.quantize_q = modules.Quantize(quant_channels, n_quants)
+#    self.quantize_q_post = nn.Conv1d(quant_channels, inter_channels, 1)
+    self.quantize_q_pre = self.quantize_p.pre
+    self.quantize_q = self.quantize_p
+    self.quantize_q_post = self.quantize_p_post
+
+    if use_sdp:
+      self.dp = StochasticDurationPredictor(hidden_channels, 192, 3, 0.5, 4, gin_channels=gin_channels)
+    else:
+      self.dp = DurationPredictor(hidden_channels, 256, 3, 0.5, gin_channels=gin_channels)
+
+    if n_speakers > 1:
+      self.emb_g = nn.Embedding(n_speakers, gin_channels)
+
+  def forward(self, x, x_lengths, y, y_lengths, sid=None):
+
+    x, enc, x_mask = self.enc_p(x, x_lengths)
+    if self.n_speakers > 0 and sid is not None:
+      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+    else:
+      g = None
+
+    z, y_mask = self.enc_q(y, y_lengths, g=g)
+    z_quant = self.quantize_conv_pre(enc).permute(0, 2, 1)
+    z_quant, z_diff, _z_id, z_dist = self.quantize(z_quant)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_conv_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+    z_dist = z_dist.permute(0, 2, 1)
+##    z_p = self.flow(z, y_mask, g=g)
+
+    with torch.no_grad():
+      # negative cross-entropy
+      s_p_sq_r = torch.exp(-2 * logs_p) # [b, d, t]
+      neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True) # [b, 1, t_s]
+      neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+      neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r)) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+      neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True) # [b, 1, t_s]
+      neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+
+      attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+      attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
+
+    w = attn.sum(2)
+    if self.use_sdp:
+      l_length = self.dp(x, x_mask, w, g=g)
+      l_length = l_length / torch.sum(x_mask)
+    else:
+      logw_ = torch.log(w + 1e-6) * x_mask
+      logw = self.dp(x, x_mask, g=g)
+      l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
+
+    # expand prior
+    enc = torch.matmul(attn.squeeze(1), enc.transpose(1, 2)).transpose(1, 2)
+    x_quant = self.quantize_conv_pre(enc).permute(0, 2, 1)
+    x_quant, x_diff, _x_id, x_dist = self.quantize(x_quant)
+##    x_quant = x_quant.permute(0, 2, 1)
+##    x_quant = self.quantize_conv_post(x_quant)
+    x_diff = x_diff.unsqueeze(0)
+    x_dist = x_dist.permute(0, 2, 1)
+
+    z_slice, ids_slice = commons.rand_slice_segments(z_quant, y_lengths, self.segment_size)
+    o = self.dec(z_slice, g=g)
+    return o, l_length, attn, ids_slice, x_mask, y_mask, (x_diff, x_dist, z_diff, z_dist)
+
+  def infer(self, x, x_lengths, sid=None, noise_scale=1, length_scale=1, noise_scale_w=1., max_len=None):
+    x, enc, x_mask = self.enc_p(x, x_lengths)
+    if self.n_speakers > 0:
+      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+    else:
+      g = None
+
+    if self.use_sdp:
+      logw = self.dp(x, x_mask, g=g, reverse=True, noise_scale=noise_scale_w)
+    else:
+      logw = self.dp(x, x_mask, g=g)
+    w = torch.exp(logw) * x_mask * length_scale
+    w_ceil = torch.ceil(w)
+    y_lengths = torch.clamp_min(torch.sum(w_ceil, [1, 2]), 1).long()
+    y_mask = torch.unsqueeze(commons.sequence_mask(y_lengths, None), 1).to(x_mask.dtype)
+    attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+    attn = commons.generate_path(w_ceil, attn_mask)
+
+    enc = torch.matmul(attn.squeeze(1), enc.transpose(1, 2)).transpose(1, 2) # [b, t', t], [b, t, d] -> [b, d, t']
+    x_quant = self.quantize_conv_pre(enc).permute(0, 2, 1)
+    x_quant, x_diff, _x_id, x_dist = self.quantize(x_quant)
+    x_quant = x_quant.permute(0, 2, 1)
+    x_quant = self.quantize_conv_post(x_quant)
+    x_diff = x_diff.unsqueeze(0)
+    x_dist = x_dist.permute(0, 2, 1)
+
+    o = self.dec((x_quant * y_mask)[:,:,:max_len], g=g)
+    return o, attn, y_mask, (x_diff, x_dist)
+
+  def voice_conversion(self, y, y_lengths, sid_src, sid_tgt):
+    assert self.n_speakers > 0, "n_speakers have to be larger than 0."
+    g_src = self.emb_g(sid_src).unsqueeze(-1)
+    enc, y_mask = self.enc_q(y, y_lengths, g=g_src)
+
+    z_quant = self.quantize_conv_pre(enc).permute(0, 2, 1)
+    z_quant, z_diff, _z_id, z_dist = self.quantize(z_quant)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_conv_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+    z_dist = z_dist.permute(0, 2, 1)
+
+    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+    o = self.dec(z_quant * y_mask, g=g_tgt)
+    return o, y_mask, (z_diff, z_dist)
+
+
+class VoiceConverterTrn(SynthesizerTrn):
+  """
+  Voice Conveter for Training
+  """
+
+  def __init__(self, 
+    n_vocab,
+    spec_channels,
+    segment_size,
+    inter_channels,
+    hidden_channels,
+    filter_channels,
+    n_heads,
+    n_layers,
+    kernel_size,
+    p_dropout,
+    resblock, 
+    resblock_kernel_sizes, 
+    resblock_dilation_sizes, 
+    upsample_rates, 
+    upsample_initial_channel, 
+    upsample_kernel_sizes,
+    n_speakers=0,
+    gin_channels=0,
+    use_sdp=True,
+    **kwargs):
+
+    super().__init__(
+      n_vocab,
+      spec_channels,
+      segment_size,
+      inter_channels,
+      hidden_channels,
+      filter_channels,
+      n_heads,
+      n_layers,
+      kernel_size,
+      p_dropout,
+      resblock, 
+      resblock_kernel_sizes, 
+      resblock_dilation_sizes, 
+      upsample_rates, 
+      upsample_initial_channel, 
+      upsample_kernel_sizes,
+      n_speakers=n_speakers,
+      gin_channels=gin_channels,
+      use_sdp=use_sdp,
+      **kwargs,
+    )
+
+  def forward(self, x, x_lengths, y, y_lengths, sid=None, target_sid=None, noise_scale=1):
+
+    x, m_p, logs_p, x_mask = self.enc_p(x, x_lengths)
+    if self.n_speakers > 0:
+      g = self.emb_g(sid).unsqueeze(-1) # [b, h, 1]
+      g_target = self.emb_g(target_sid).unsqueeze(-1)
+    else:
+      g = None
+      g_target=None
+
+    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    z_p = self.flow(z, y_mask, g=g)
+
+    with torch.no_grad():
+      # negative cross-entropy
+      s_p_sq_r = torch.exp(-2 * logs_p) # [b, d, t]
+      neg_cent1 = torch.sum(-0.5 * math.log(2 * math.pi) - logs_p, [1], keepdim=True) # [b, 1, t_s]
+      neg_cent2 = torch.matmul(-0.5 * (z_p ** 2).transpose(1, 2), s_p_sq_r) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+      neg_cent3 = torch.matmul(z_p.transpose(1, 2), (m_p * s_p_sq_r)) # [b, t_t, d] x [b, d, t_s] = [b, t_t, t_s]
+      neg_cent4 = torch.sum(-0.5 * (m_p ** 2) * s_p_sq_r, [1], keepdim=True) # [b, 1, t_s]
+      neg_cent = neg_cent1 + neg_cent2 + neg_cent3 + neg_cent4
+
+      attn_mask = torch.unsqueeze(x_mask, 2) * torch.unsqueeze(y_mask, -1)
+      attn = monotonic_align.maximum_path(neg_cent, attn_mask.squeeze(1)).unsqueeze(1).detach()
+
+    w = attn.sum(2)
+    if self.use_sdp:
+      l_length = self.dp(x, x_mask, w, g=g)
+      l_length = l_length / torch.sum(x_mask)
+    else:
+      logw_ = torch.log(w + 1e-6) * x_mask
+      logw = self.dp(x, x_mask, g=g)
+      l_length = torch.sum((logw - logw_)**2, [1,2]) / torch.sum(x_mask) # for averaging 
+
+    # expand prior
+    m_p = torch.matmul(attn.squeeze(1), m_p.transpose(1, 2)).transpose(1, 2)
+    logs_p = torch.matmul(attn.squeeze(1), logs_p.transpose(1, 2)).transpose(1, 2)
+
+    z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
+##    z_mask = commons.slice_segments(y_mask, ids_slice, self.segment_size)
+
+    z_vc = self.flow(z_p, y_mask, g=g_target, reverse=True)
+    z_vc = commons.slice_segments(z_vc * y_mask, ids_slice, self.segment_size)
+
+    z_p_target = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+    z_target = self.flow(z_p_target, y_mask, g=g_target, reverse=True)
+    z_target = commons.slice_segments(z_target * y_mask, ids_slice, self.segment_size)
+
+    o = self.dec(z_slice, g=g)
+    # generate voice of another speaker
+    o_target = self.dec(z_target, g=g_target)
+    # convert voice to another speaker
+    o_vc = self.dec(z_vc, g=g_target)
+    return o, l_length, attn, ids_slice, x_mask, y_mask, (z, z_p, m_p, logs_p, m_q, logs_q), o_target, o_vc
+
+
 class VoiceConverter(nn.Module):
   """
   Voice Converter
@@ -583,6 +933,7 @@ class VoiceConverter(nn.Module):
 
     super().__init__()
     self.spec_channels = spec_channels
+    self.segment_size = segment_size
     self.inter_channels = inter_channels
     self.hidden_channels = hidden_channels
     self.resblock = resblock
@@ -599,9 +950,17 @@ class VoiceConverter(nn.Module):
     self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
     self.emb_g = nn.Embedding(n_speakers, gin_channels)
 
-  def forward(self, y, y_lengths, sid_src, sid_tgt, repeat=False):
+  def forward(self, y, y_lengths, sid):
+    g = self.emb_g(sid).unsqueeze(-1)
+    z, m_q, logs_q, y_mask = self.enc_q(y, y_lengths, g=g)
+    z_p = self.flow(z, y_mask, g=g)
+    z_slice, ids_slice = commons.rand_slice_segments(z, y_lengths, self.segment_size)
+    o = self.dec(z_slice, g=g)
+    return o, ids_slice, y_mask, (z, z_p, m_q, logs_q)
+
+  def infer(self, y, y_lengths, sid_src, sid_tgt, multiple_target=False):
     y_mask, (z, z_p, m_q, logs_q) = self.encode(y, y_lengths, sid_src)
-    if repeat:
+    if multiple_target:
       n_repeat = sid_tgt.size(0) // sid_src.size(0)
       y_mask = y_mask.repeat(n_repeat, 1, 1)
       z = z.repeat(n_repeat, 1, 1)
@@ -609,7 +968,7 @@ class VoiceConverter(nn.Module):
       m_q = m_q.repeat(n_repeat, 1, 1)
       logs_q = logs_q.repeat(n_repeat, 1, 1)
     o_hat, z_hat = self.decode(z_p, y_mask, sid_tgt)
-    return o_hat, y_mask, (z, z_p, z_hat, m_q, logs_q)
+    return o_hat, y_mask, (z, z_p, z_hat)
 
   def encode(self, y, y_lengths, sid):
     g_src = self.emb_g(sid).unsqueeze(-1)
@@ -622,3 +981,216 @@ class VoiceConverter(nn.Module):
     z_hat = self.flow(z_p, y_mask, g=g_tgt, reverse=True)
     o_hat = self.dec(z_hat * y_mask, g=g_tgt)
     return o_hat, z_hat
+
+
+class VQPosteriorEncoder(nn.Module):
+  def __init__(self,
+      in_channels,
+      out_channels,
+      hidden_channels,
+      kernel_size,
+      dilation_rate,
+      n_layers,
+      gin_channels=0):
+    super().__init__()
+    self.in_channels = in_channels
+    self.out_channels = out_channels
+    self.hidden_channels = hidden_channels
+    self.kernel_size = kernel_size
+    self.dilation_rate = dilation_rate
+    self.n_layers = n_layers
+    self.gin_channels = gin_channels
+
+    self.pre = nn.Conv1d(in_channels, hidden_channels, 1)
+    self.enc = modules.WN(hidden_channels, kernel_size, dilation_rate, n_layers, gin_channels=gin_channels)
+    self.proj = nn.Conv1d(hidden_channels, out_channels, 1)
+
+  def forward(self, x, x_lengths, g=None):
+    x_mask = torch.unsqueeze(commons.sequence_mask(x_lengths, x.size(2)), 1).to(x.dtype)
+    x = self.pre(x) * x_mask
+    x = self.enc(x, x_mask, g=g)
+    return self.proj(x) * x_mask, x_mask
+
+
+class VQVoiceConverter(nn.Module):
+  """
+  Voice Converter
+  """
+
+  def __init__(self,
+    spec_channels,
+    segment_size,
+    inter_channels,
+    hidden_channels,
+    resblock, 
+    resblock_kernel_sizes, 
+    resblock_dilation_sizes, 
+    upsample_rates, 
+    upsample_initial_channel, 
+    upsample_kernel_sizes,
+    n_speakers=2,
+    gin_channels=0,
+    **kwargs):
+
+    super().__init__()
+    self.spec_channels = spec_channels
+    self.segment_size = segment_size
+    self.inter_channels = inter_channels
+    self.hidden_channels = hidden_channels
+    self.resblock = resblock
+    self.resblock_kernel_sizes = resblock_kernel_sizes
+    self.resblock_dilation_sizes = resblock_dilation_sizes
+    self.upsample_rates = upsample_rates
+    self.upsample_initial_channel = upsample_initial_channel
+    self.upsample_kernel_sizes = upsample_kernel_sizes
+    self.n_speakers = n_speakers
+    self.gin_channels = gin_channels
+
+    ## TODO initial parameter
+    dim_quant = 64
+    n_quant = 512
+
+    self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
+    self.enc_q = VQPosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
+    self.quantize_conv_pre = nn.Conv1d(inter_channels, dim_quant, 1)
+    self.quantize_conv_post = nn.Conv1d(dim_quant, inter_channels, 1)
+    self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
+    self.emb_g = nn.Embedding(n_speakers, gin_channels)
+    self.quantize = modules.Quantize(dim_quant, n_quant)
+
+  def forward(self, y, y_lengths, sid):
+    g = self.emb_g(sid).unsqueeze(-1)
+    enc, y_mask = self.enc_q(y, y_lengths, g=g)
+    enc = self.flow(enc, y_mask, g=g)
+
+    enc_slice, ids_slice = commons.rand_slice_segments(enc, y_lengths, self.segment_size)
+
+    z_quant = self.quantize_conv_pre(enc_slice).permute(0, 2, 1)
+    z_quant, z_diff, *_ = self.quantize(z_quant)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_conv_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+
+    z_mask = commons.slice_segments(y_mask, ids_slice, self.segment_size)
+    z_quant = self.flow(z_quant, z_mask, g=g, reverse=True)
+
+    o = self.dec(z_quant, g=g)
+    return o, ids_slice, y_mask, z_diff
+
+  def infer(self, y, y_lengths, sid_src, sid_tgt, multiple_target=False):
+    g_src = self.emb_g(sid_src).unsqueeze(-1)
+    enc, y_mask = self.enc_q(y, y_lengths, g=g_src)
+    enc = self.flow(enc, y_mask, g=g_src)
+
+    z_quant = self.quantize_conv_pre(enc).permute(0, 2, 1)
+    z_quant, z_diff, *_ = self.quantize(z_quant)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_conv_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+
+    if multiple_target:
+      n_repeat = sid_tgt.size(0) // sid_src.size(0)
+      y_mask = y_mask.repeat(n_repeat, 1, 1)
+      z_quant = z_quant.repeat(n_repeat, 1, 1)
+
+    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+    z_quant = self.flow(z_quant, y_mask, g=g_tgt, reverse=True)
+    o = self.dec(z_quant * y_mask, g=g_tgt)
+    return o, y_mask, z_diff
+
+
+class VQVoiceConverter2(nn.Module):
+  """
+  Voice Converter
+  """
+
+  def __init__(self,
+    spec_channels,
+    segment_size,
+    inter_channels,
+    hidden_channels,
+    resblock, 
+    resblock_kernel_sizes, 
+    resblock_dilation_sizes, 
+    upsample_rates, 
+    upsample_initial_channel, 
+    upsample_kernel_sizes,
+    n_speakers=2,
+    gin_channels=0,
+    **kwargs):
+
+    super().__init__()
+    self.spec_channels = spec_channels
+    self.segment_size = segment_size
+    self.inter_channels = inter_channels
+    self.hidden_channels = hidden_channels
+    self.resblock = resblock
+    self.resblock_kernel_sizes = resblock_kernel_sizes
+    self.resblock_dilation_sizes = resblock_dilation_sizes
+    self.upsample_rates = upsample_rates
+    self.upsample_initial_channel = upsample_initial_channel
+    self.upsample_kernel_sizes = upsample_kernel_sizes
+    self.n_speakers = n_speakers
+    self.gin_channels = gin_channels
+
+    ## TODO initial parameter
+    self.dim_quant = 64
+    self.n_quant_groups = 2
+    n_quant = 512
+
+    self.dec = Generator(inter_channels, resblock, resblock_kernel_sizes, resblock_dilation_sizes, upsample_rates, upsample_initial_channel, upsample_kernel_sizes, gin_channels=gin_channels)
+    self.enc_q = VQPosteriorEncoder(spec_channels, inter_channels, hidden_channels, 5, 1, 16, gin_channels=gin_channels)
+#    self.flow = ResidualCouplingBlock(inter_channels, hidden_channels, 5, 1, 4, gin_channels=gin_channels)
+    self.emb_g = nn.Embedding(n_speakers, gin_channels)
+    self.quantize_pre = nn.Conv1d(inter_channels, self.dim_quant, 1)
+    self.quantize = modules.Quantize(self.dim_quant // 2, n_quant)
+    self.quantize_2 = modules.Quantize(self.dim_quant // 2, n_quant)
+    self.quantize_post = nn.Conv1d(self.dim_quant, inter_channels, 1)
+
+  def forward(self, y, y_lengths, sid):
+    g = self.emb_g(sid).unsqueeze(-1)
+    enc, y_mask = self.enc_q(y, y_lengths, g=g)
+#    enc = self.flow(enc, y_mask, g=g)
+
+    enc_slice, ids_slice = commons.rand_slice_segments(enc, y_lengths, self.segment_size)
+
+    z_quant = self.quantize_pre(enc_slice).permute(0, 2, 1)
+    z_quant, z2_quant = torch.split(z_quant, self.dim_quant // 2, dim=-1)
+    z_quant, z_diff, *_ = self.quantize(z_quant)
+    z2_quant, z2_diff, *_ = self.quantize_2(z_quant)
+    z_quant = torch.cat((z_quant, z2_quant), dim=-1)
+    z_diff = 0.5 * (z_diff + z2_diff)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+
+    z_mask = commons.slice_segments(y_mask, ids_slice, self.segment_size)
+#    z_quant = self.flow(z_quant, z_mask, g=g, reverse=True)
+
+    o = self.dec(z_quant, g=g)
+    return o, ids_slice, y_mask, z_diff
+
+  def infer(self, y, y_lengths, sid_src, sid_tgt, multiple_target=False):
+    g_src = self.emb_g(sid_src).unsqueeze(-1)
+    enc, y_mask = self.enc_q(y, y_lengths, g=g_src)
+#    enc = self.flow(enc, y_mask, g=g_src)
+
+    z_quant = self.quantize_pre(enc).permute(0, 2, 1)
+    z_quant, z2_quant = torch.split(z_quant, self.dim_quant // 2, dim=-1)
+    z_quant, z_diff, *_ = self.quantize(z_quant)
+    z2_quant, z2_diff, *_ = self.quantize_2(z_quant)
+    z_quant = torch.cat((z_quant, z2_quant), dim=-1)
+    z_diff = 0.5 * (z_diff + z2_diff)
+    z_quant = z_quant.permute(0, 2, 1)
+    z_quant = self.quantize_post(z_quant)
+    z_diff = z_diff.unsqueeze(0)
+
+    if multiple_target:
+      n_repeat = sid_tgt.size(0) // sid_src.size(0)
+      y_mask = y_mask.repeat(n_repeat, 1, 1)
+      z_quant = z_quant.repeat(n_repeat, 1, 1)
+
+    g_tgt = self.emb_g(sid_tgt).unsqueeze(-1)
+#    z_quant = self.flow(z_quant, y_mask, g=g_tgt, reverse=True)
+    o = self.dec(z_quant * y_mask, g=g_tgt)
+    return o, y_mask, z_diff

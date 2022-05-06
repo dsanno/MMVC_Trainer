@@ -13,6 +13,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.cuda.amp import autocast, GradScaler
 from tqdm import tqdm
+##
+import soundfile as sf
+##
 
 import commons
 import utils
@@ -48,8 +51,10 @@ def main():
   os.environ['MASTER_PORT'] = '6000'
 
   hps = utils.get_hparams()
-  mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
-
+#  mp.spawn(run, nprocs=n_gpus, args=(n_gpus, hps,))
+##
+  run(0, 1, hps)
+##
 
 def run(rank, n_gpus, hps):
   global global_step
@@ -60,7 +65,11 @@ def run(rank, n_gpus, hps):
     writer = SummaryWriter(log_dir=hps.model_dir)
     writer_eval = SummaryWriter(log_dir=os.path.join(hps.model_dir, "eval"))
 
-  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+##  dist.init_process_group(backend='nccl', init_method='env://', world_size=n_gpus, rank=rank)
+##
+# for windows
+  dist.init_process_group(backend='gloo', init_method='env://', world_size=n_gpus, rank=rank)
+##
   torch.manual_seed(hps.train.seed)
   torch.cuda.set_device(rank)
 
@@ -73,14 +82,18 @@ def run(rank, n_gpus, hps):
       rank=rank,
       shuffle=True)
   collate_fn = TextAudioSpeakerCollate()
-  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
-      collate_fn=collate_fn, batch_sampler=train_sampler)
+##  train_loader = DataLoader(train_dataset, num_workers=8, shuffle=False, pin_memory=True,
+##      collate_fn=collate_fn)
+##
+  train_loader = DataLoader(train_dataset, num_workers=1, shuffle=False, pin_memory=True,
+      collate_fn=collate_fn, batch_sampler=train_sampler, prefetch_factor=hps.train.batch_size)
+##
   index_to_sid = train_dataset.get_unique_sids().cuda(rank)
   sid_to_index = torch.zeros(hps.data.n_speakers, dtype=torch.int64, device=index_to_sid.device)
   sid_to_index[index_to_sid] = torch.arange(index_to_sid.size(0), device=index_to_sid.device)
   if rank == 0:
     eval_dataset = TextAudioSpeakerLoader(hps.data.validation_files_notext, hps.data)
-    eval_loader = DataLoader(eval_dataset, num_workers=8, shuffle=False,
+    eval_loader = DataLoader(eval_dataset, num_workers=0, shuffle=False,
         batch_size=hps.train.batch_size, pin_memory=True,
         drop_last=False, collate_fn=collate_fn)
   net_g = VoiceConverter(
@@ -88,7 +101,7 @@ def run(rank, n_gpus, hps):
       hps.train.segment_size // hps.data.hop_length,
       n_speakers=hps.data.n_speakers,
       **hps.model).cuda(rank)
-  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm, periods=[]).cuda(rank)
+  net_d = MultiPeriodDiscriminator(hps.model.use_spectral_norm).cuda(rank)
   optim_g = torch.optim.AdamW(
       net_g.parameters(), 
       hps.train.learning_rate, 
@@ -156,18 +169,16 @@ def train_and_evaluate(rank, epoch, hps, nets, optims, scaler, loaders, sid_to_i
     speakers = speakers.cuda(rank, non_blocking=True)
 
     with autocast(enabled=hps.train.fp16_run):
-      spec_segment_size = hps.train.segment_size // hps.data.hop_length
-      spec, ids_slice = commons.rand_slice_segments(spec, spec_lengths, spec_segment_size)
-      spec_lengths = torch.full((spec.shape[0],), spec_segment_size, dtype=torch.int64, device=spec.device)
-      y_hat, z_mask, (z, z_p, z_hat, m_q, logs_q) = net_g(spec, spec_lengths, speakers, speakers)
+      y_hat, ids_slice, z_mask, (z, z_p, m_q, logs_q) = net_g(spec, spec_lengths, speakers)
 
-      y_mel = spec_to_mel_torch(
+      mel = spec_to_mel_torch(
           spec, 
           hps.data.filter_length, 
           hps.data.n_mel_channels, 
           hps.data.sampling_rate,
           hps.data.mel_fmin, 
           hps.data.mel_fmax)
+      y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
       y_hat_mel = mel_spectrogram_torch(
           y_hat.squeeze(1), 
           hps.data.filter_length, 
@@ -256,18 +267,16 @@ def evaluate(hps, generator, eval_loader, sid_to_index, index_to_sid, writer_eva
         #autocastはfp16のおまじない
         with autocast(enabled=hps.train.fp16_run):
           #Generator
-          spec_segment_size = hps.train.segment_size // hps.data.hop_length
-          spec, ids_slice = commons.rand_slice_segments(spec, spec_lengths, spec_segment_size)
-          spec_lengths = torch.full((spec.shape[0],), spec_segment_size, dtype=torch.int64, device=spec.device)
-          y_hat, z_mask, (z, z_p, z_hat, m_q, logs_q) = generator(spec, spec_lengths, speakers, speakers)
+          y_hat, ids_slice, z_mask, (z, z_p, m_q, logs_q) = generator(spec, spec_lengths, speakers)
 
-          y_mel = spec_to_mel_torch(
+          mel = spec_to_mel_torch(
               spec, 
               hps.data.filter_length, 
               hps.data.n_mel_channels, 
               hps.data.sampling_rate,
               hps.data.mel_fmin, 
               hps.data.mel_fmax)
+          y_mel = commons.slice_segments(mel, ids_slice, hps.train.segment_size // hps.data.hop_length)
           y_hat_mel = mel_spectrogram_torch(
               y_hat.squeeze(1), 
               hps.data.filter_length, 
@@ -312,7 +321,7 @@ def evaluate(hps, generator, eval_loader, sid_to_index, index_to_sid, writer_eva
         speakers = speakers[:1]
         break
 
-      y_hat, mask, *_ = generator(spec, spec_lengths, speakers, speakers)
+      y_hat, mask, *_ = generator.module.infer(spec, spec_lengths, speakers, speakers)
       y_hat_lengths = mask.sum([1,2]).long() * hps.data.hop_length
 
       mel = spec_to_mel_torch(
@@ -335,7 +344,7 @@ def evaluate(hps, generator, eval_loader, sid_to_index, index_to_sid, writer_eva
 
       # Convert voice to another speaker
       another_speakers = index_to_sid[(sid_to_index[speakers] + 1) % index_to_sid.size(0)]
-      vc_y_hat, vc_mask, *_ = generator(spec, spec_lengths, speakers, another_speakers)
+      vc_y_hat, vc_mask, *_ = generator.module.infer(spec, spec_lengths, speakers, another_speakers)
       vc_y_hat_lengths = vc_mask.sum([1,2]).long() * hps.data.hop_length
 
       vc_y_hat_mel = mel_spectrogram_torch(
@@ -357,6 +366,9 @@ def evaluate(hps, generator, eval_loader, sid_to_index, index_to_sid, writer_eva
       "gen/audio": y_hat[0,:,:y_hat_lengths[0]],
       "convert/audio": vc_y_hat[0,:,:vc_y_hat_lengths[0]],
     }
+    ##
+    sf.write(os.path.join(hps.model_dir, 'voice_vc_{0:06d}.wav'.format(global_step)), vc_y_hat[0,:,:vc_y_hat_lengths[0]].transpose(0, 1).detach().cpu().numpy(), hps.data.sampling_rate)
+    ##
     if global_step == 0:
       image_dict.update({"gt/mel": utils.plot_spectrogram_to_numpy(mel[0].cpu().numpy())})
       audio_dict.update({"gt/audio": y[0,:,:y_lengths[0]]})
